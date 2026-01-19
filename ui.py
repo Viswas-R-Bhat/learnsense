@@ -1,6 +1,6 @@
 import streamlit as st
 import uuid
-from backend import full_analysis, recheck_answer, generate_questions_from_notes
+from backend import tutor_turn, generate_questions_from_notes
 
 st.set_page_config(page_title="LearnSense", page_icon="🧠", layout="wide")
 
@@ -20,6 +20,13 @@ st.markdown(
 
       /* Input rounded */
       [data-testid="stChatInput"] textarea { border-radius: 14px !important; }
+
+      /* Steps list */
+      .ls-step { padding: 8px 10px; border-radius: 10px; border: 1px solid rgba(128,128,128,0.18); margin: 6px 0; }
+      .ls-step-wrong { border: 1px solid rgba(255,0,0,0.35); background: rgba(255,0,0,0.04); }
+
+      /* Dataframe tweak */
+      [data-testid="stDataFrame"] { border-radius: 12px; overflow: hidden; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -32,21 +39,8 @@ if "user_id" not in st.session_state:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-if "last_misconception" not in st.session_state:
-    st.session_state.last_misconception = None
-if "last_misconception_key" not in st.session_state:
-    st.session_state.last_misconception_key = None
-
-if "mode" not in st.session_state:
-    st.session_state.mode = "analyze"  # analyze | recheck
-
-if "attempts_by_key" not in st.session_state:
-    st.session_state.attempts_by_key = {}
-
 if "pending" not in st.session_state:
     st.session_state.pending = False
-if "pending_mode" not in st.session_state:
-    st.session_state.pending_mode = "analyze"
 if "pending_input" not in st.session_state:
     st.session_state.pending_input = ""
 if "pending_placeholder_index" not in st.session_state:
@@ -66,16 +60,28 @@ if "current_topic" not in st.session_state:
     st.session_state.current_topic = "General"
 if "current_question" not in st.session_state:
     st.session_state.current_question = ""
-
-# Notes -> question bank
-if "question_bank" not in st.session_state:
-    st.session_state.question_bank = []
+if "hint_level" not in st.session_state:
+    st.session_state.hint_level = 1  # 1-4
 
 # Attachment state (ChatGPT-like "+")
 if "uploaded_image_bytes" not in st.session_state:
     st.session_state.uploaded_image_bytes = None
 if "uploaded_image_mime" not in st.session_state:
     st.session_state.uploaded_image_mime = None
+
+# Notes -> question bank
+if "question_bank" not in st.session_state:
+    st.session_state.question_bank = []
+
+# Last response + last student answer (for Give up)
+if "last_tutor_response" not in st.session_state:
+    st.session_state.last_tutor_response = None
+if "last_student_answer" not in st.session_state:
+    st.session_state.last_student_answer = ""
+
+# Internal: force give up on next model call
+if "_force_give_up" not in st.session_state:
+    st.session_state._force_give_up = False
 
 # Debounce
 if "last_user_text" not in st.session_state:
@@ -92,94 +98,6 @@ def render_msg(role: str, content: str):
         st.markdown(content)
 
 
-def misconception_key(m: dict):
-    concept = (m or {}).get("concept", "") or ""
-    why_wrong = (m or {}).get("why_wrong", "") or ""
-    return f"{concept}::{why_wrong[:80]}"
-
-
-def is_give_up(text: str):
-    t = (text or "").strip().lower()
-    phrases = ["i give up", "give up", "show answer", "answer please"]
-    return any(p in t for p in phrases)
-
-
-def _limit_sentences(text: str, max_sentences: int = 3, min_sentences: int = 2):
-    text = (text or "").replace("\n", " ").strip()
-    if not text:
-        text = "Here is the correct idea in brief. Focus on the defining property and how it applies."
-    sentences = [s.strip() for s in text.split(". ") if s.strip()]
-    trimmed = sentences[:max_sentences] if sentences else [text]
-    if len(trimmed) < min_sentences:
-        trimmed.append("That is the correct framing")
-    out = ". ".join(trimmed).strip()
-    if not out.endswith("."):
-        out += "."
-    return out
-
-
-def final_answer_for(m: dict):
-    if not m:
-        return "Here is the correct idea in brief. Focus on the defining property and how it applies."
-    final_answer = m.get("final_answer", "") or ""
-    if final_answer.strip():
-        return _limit_sentences(final_answer)
-    hint = m.get("hint", "") or ""
-    why_wrong = m.get("why_wrong", "") or ""
-    parts = []
-    if hint:
-        parts.append(f"Key idea: {hint.strip()}")
-    if why_wrong:
-        parts.append(why_wrong.strip())
-    return _limit_sentences(" ".join(parts))
-
-
-def format_tutor_message(concept: str, why_wrong: str, hint: str, diagnostic: str,
-                         explanation: str, example: str, follow_up: str) -> str:
-    parts = []
-    if concept:
-        parts.append(f"### What’s going wrong\nIt looks like the confusion is about **{concept}**.")
-    if why_wrong:
-        parts.append(f"**Why this isn’t correct yet:** {why_wrong}")
-    if hint:
-        parts.append(f"### Hint\n{hint}")
-    if diagnostic:
-        parts.append(f"### Quick check\n{diagnostic}")
-    if explanation:
-        parts.append(f"### Explanation\n{explanation}")
-    if example:
-        parts.append(f"### Example\n{example}")
-    if follow_up:
-        parts.append(f"### Try again\n{follow_up}")
-    else:
-        parts.append("### Try again\nExplain it again in your own words.")
-    return "\n\n".join([p for p in parts if p])
-
-
-def reveal_answer_and_reset(prefix: str = "Got it — here’s the correct answer"):
-    m = st.session_state.last_misconception
-    if not m:
-        add_msg("assistant", "Share your answer and I’ll help.")
-        st.session_state.mode = "analyze"
-        return
-
-    final_answer = final_answer_for(m)
-    assistant_text = (
-        f"### {prefix}\n\n"
-        f"{final_answer}\n\n"
-        "If you want, send another answer to analyze."
-    )
-    add_msg("assistant", assistant_text)
-
-    key = st.session_state.last_misconception_key
-    if key:
-        st.session_state.attempts_by_key.pop(key, None)
-
-    st.session_state.last_misconception = None
-    st.session_state.last_misconception_key = None
-    st.session_state.mode = "analyze"
-
-
 def is_academic_query(text: str) -> bool:
     t = (text or "").lower()
     banned = [
@@ -193,20 +111,99 @@ def is_academic_query(text: str) -> bool:
 
 def reset_all():
     st.session_state.messages = []
-    st.session_state.last_misconception = None
-    st.session_state.last_misconception_key = None
-    st.session_state.mode = "analyze"
     st.session_state.pending = False
-    st.session_state.pending_mode = "analyze"
     st.session_state.pending_input = ""
     st.session_state.pending_placeholder_index = None
     st.session_state.pending_request_id = None
     st.session_state.cancel_requested = False
     st.session_state.cancel_request_id = None
-    st.session_state.attempts_by_key = {}
     st.session_state.last_user_text = None
     st.session_state.uploaded_image_bytes = None
     st.session_state.uploaded_image_mime = None
+    st.session_state.last_tutor_response = None
+    st.session_state.last_student_answer = ""
+    st.session_state.hint_level = 1
+    st.session_state._force_give_up = False
+    st.rerun()
+
+
+def _first_text_message(tr: dict) -> str:
+    msgs = (tr or {}).get("messages") or []
+    if isinstance(msgs, list) and msgs and isinstance(msgs[0], dict):
+        return (msgs[0].get("text") or "").strip()
+    return ""
+
+
+def _render_artifacts(tr: dict):
+    if not isinstance(tr, dict):
+        return
+
+    mode = tr.get("mode")
+    artifacts = tr.get("artifacts") or {}
+    if not isinstance(artifacts, dict):
+        artifacts = {}
+
+    # ----- DIAGNOSE: steps + wrong-step highlight -----
+    steps = artifacts.get("steps") or []
+    wrong_idx = artifacts.get("wrong_step_index", None)
+
+    if mode == "DIAGNOSE" and isinstance(steps, list) and steps:
+        st.markdown("##### 🧪 Mistake Microscope")
+        for i, s in enumerate(steps):
+            cls = "ls-step ls-step-wrong" if (isinstance(wrong_idx, int) and wrong_idx == i) else "ls-step"
+            st.markdown(f'<div class="{cls}"><b>Step {i+1}.</b> {s}</div>', unsafe_allow_html=True)
+
+    # ----- RUBRIC: solution + minimal fix + rubric table -----
+    if mode == "RUBRIC":
+        sol = artifacts.get("solution_steps") or []
+        minimal_fix = (artifacts.get("minimal_fix") or "").strip()
+        rubric = artifacts.get("rubric") or []
+
+        st.markdown("##### ✅ Full Solution")
+        if isinstance(sol, list) and sol:
+            for i, s in enumerate(sol):
+                st.markdown(f"- **Step {i+1}:** {s}")
+        else:
+            st.markdown("- (No steps returned)")
+
+        if minimal_fix:
+            st.markdown("##### 🔧 Minimal Fix to Your Attempt")
+            st.info(minimal_fix)
+
+        if isinstance(rubric, list) and rubric:
+            st.markdown("##### 🧾 Grading Rubric")
+            st.dataframe(rubric, use_container_width=True)
+
+    # ----- Concept dashboard -----
+    dash = artifacts.get("concept_dashboard")
+    if isinstance(dash, dict):
+        weakest = dash.get("weakest") or []
+        frequent = dash.get("frequent") or []
+        with st.expander("📌 Your learning dashboard", expanded=False):
+            if weakest:
+                st.markdown("**Weakest concepts (improve next):**")
+                for w in weakest[:3]:
+                    concept = w.get("concept", "")
+                    mastery = int(float(w.get("mastery_est", 0) or 0))
+                    st.markdown(f"- {concept} — mastery ~{mastery}%")
+            if frequent:
+                st.markdown("**Most frequent misconceptions:**")
+                for f in frequent[:3]:
+                    concept = f.get("concept", "")
+                    cnt = int(f.get("misconception_count", 0) or 0)
+                    st.markdown(f"- {concept} — {cnt} times")
+
+
+def _start_pending(user_visible_user_msg: str, pending_student_input: str, force_give_up: bool):
+    add_msg("user", user_visible_user_msg)
+    add_msg("assistant", "⏳ Analyzing…")
+    st.session_state.pending_placeholder_index = len(st.session_state.messages) - 1
+    st.session_state.pending_input = pending_student_input
+    st.session_state.pending = True
+    st.session_state.pending_request_id = str(uuid.uuid4())
+    st.session_state.cancel_requested = False
+    st.session_state.cancel_request_id = None
+    st.session_state._force_give_up = force_give_up
     st.rerun()
 
 
@@ -235,6 +232,13 @@ with st.sidebar:
         value=st.session_state.current_question,
         height=80,
         placeholder="E.g., Differentiate AVL and BST.",
+    )
+
+    st.session_state.hint_level = st.select_slider(
+        "Hint level",
+        options=[1, 2, 3, 4],
+        value=st.session_state.hint_level,
+        help="1 = subtle hint, 3 = explicit hint, 4 = full answer (or click Give up).",
     )
 
     st.markdown("---")
@@ -282,15 +286,37 @@ with st.sidebar:
                 selected = st.session_state.question_bank[idx]
                 st.session_state.current_question = selected.get("q", "")
                 st.session_state.current_topic = selected.get("topic", st.session_state.current_topic)
-                st.session_state.mode = "analyze"
                 st.session_state.uploaded_image_bytes = None
                 st.session_state.uploaded_image_mime = None
+                st.session_state.last_tutor_response = None
+                st.session_state.last_student_answer = ""
                 st.rerun()
 
     st.markdown("---")
     if st.button("🔄 Reset chat", use_container_width=True):
         reset_all()
 
+    # Give up control (only when you have a last response, and it's not correct, and not generating)
+    if st.session_state.last_tutor_response and not st.session_state.pending:
+        tr = st.session_state.last_tutor_response
+        is_correct = bool(tr.get("is_correct", False))
+        attempts_used = int(tr.get("attempts_used", 0) or 0)
+
+        st.markdown("---")
+        st.caption(f"Attempts so far: {attempts_used}")
+
+        if not is_correct:
+            if st.button("🏳️ Give up (show answer + rubric)", use_container_width=True):
+                # Use the last student answer as the attempt context for rubric generation
+                attempt_text = (st.session_state.last_student_answer or "").strip()
+                if not attempt_text:
+                    attempt_text = "I don't know."
+
+                _start_pending(
+                    user_visible_user_msg="I give up.",
+                    pending_student_input=attempt_text,
+                    force_give_up=True
+                )
 
 # ==========================
 # MAIN CHAT
@@ -300,23 +326,6 @@ if len(st.session_state.messages) == 0:
 
 for msg in st.session_state.messages:
     render_msg(msg["role"], msg["content"])
-
-# Recheck controls
-if (
-    st.session_state.mode == "recheck"
-    and st.session_state.last_misconception
-    and not st.session_state.pending
-):
-    key = st.session_state.last_misconception_key or "current"
-    attempts = st.session_state.attempts_by_key.get(key, 0)
-    remaining = max(0, 3 - attempts)
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        st.caption(f"Attempts left: {remaining}")
-    with c2:
-        if st.button("🏳️ Give up"):
-            reveal_answer_and_reset("No worries — here’s the correct answer")
-            st.rerun()
 
 # Stop generating
 if st.session_state.pending:
@@ -330,9 +339,10 @@ if st.session_state.pending:
         st.session_state.pending_input = ""
         st.session_state.pending_placeholder_index = None
         st.session_state.pending_request_id = None
+        st.session_state._force_give_up = False
         st.rerun()
 
-# Resolve pending
+# Resolve pending (single call to tutor_turn)
 if st.session_state.pending:
     if st.session_state.cancel_requested and st.session_state.cancel_request_id == st.session_state.pending_request_id:
         st.session_state.pending = False
@@ -341,139 +351,61 @@ if st.session_state.pending:
         st.session_state.pending_request_id = None
         st.session_state.cancel_requested = False
         st.session_state.cancel_request_id = None
+        st.session_state._force_give_up = False
         st.rerun()
 
     request_id = st.session_state.pending_request_id
 
     with st.spinner("Analyzing with Gemini…"):
         assistant_text = "I couldn’t analyze that yet. Try again."
+        tr = None
         try:
-            if st.session_state.pending_mode == "recheck":
-                res = recheck_answer(
-                    st.session_state.last_misconception,
-                    st.session_state.pending_input
-                )
-                status = res.get("status", "partially_resolved")
-                feedback = (res.get("feedback", "") or "").strip()
+            tr = tutor_turn(
+                user_id=st.session_state.user_id,
+                question=st.session_state.current_question,
+                student_input=st.session_state.pending_input,
+                mode=st.session_state.learning_mode,
+                topic=st.session_state.current_topic,
+                hint_level=int(st.session_state.hint_level),
+                give_up=bool(st.session_state._force_give_up),
+                image_bytes=st.session_state.uploaded_image_bytes,
+                image_mime=st.session_state.uploaded_image_mime,
+            )
 
-                key = st.session_state.last_misconception_key or "current"
-                attempts = st.session_state.attempts_by_key.get(key, 0)
+            if isinstance(tr, dict):
+                st.session_state.last_tutor_response = tr
 
-                if status == "resolved":
-                    assistant_text = f"Nice — that clears it up.\n\n{feedback}\n\nWant another answer checked?"
-                    st.session_state.attempts_by_key.pop(key, None)
-                    st.session_state.last_misconception = None
-                    st.session_state.last_misconception_key = None
-                    st.session_state.mode = "analyze"
-                else:
-                    attempts += 1
-                    st.session_state.attempts_by_key[key] = attempts
-                    if attempts >= 3:
-                        reveal_answer_and_reset("No worries — here’s the correct answer")
-                        assistant_text = "✅ Answer revealed above."
-                        st.session_state.mode = "analyze"
-                    else:
-                        lead = "Not quite yet." if status == "unresolved" else "You're close."
-                        remaining = max(0, 3 - attempts)
-
-                        hints = (st.session_state.last_misconception or {}).get("hints", []) or []
-                        hint_line = ""
-                        if hints:
-                            idx_hint = min(len(hints) - 1, attempts - 1)
-                            hint_line = f"\n\n### Hint\n{hints[idx_hint]}"
-
-                        assistant_text = (
-                            f"### {lead}\n\n"
-                            f"{feedback}"
-                            f"{hint_line}\n\n"
-                            f"**Attempts left:** {remaining}\n\n"
-                            "### Try again\n"
-                            "Answer again in your own words."
-                        )
-                        st.session_state.mode = "recheck"
-
-            else:
-                results = full_analysis(
-                    student_input=st.session_state.pending_input,
-                    user_id=st.session_state.user_id,
-                    question=st.session_state.current_question,
-                    mode=st.session_state.learning_mode,
-                    topic=st.session_state.current_topic,
-                    image_bytes=st.session_state.uploaded_image_bytes,
-                    image_mime=st.session_state.uploaded_image_mime,
-                )
-
-                if isinstance(results, dict) and results.get("error"):
-                    assistant_text = results.get("error_message", "Please try again.")
-                    st.session_state.last_misconception = None
-                    st.session_state.last_misconception_key = None
-                    st.session_state.mode = "analyze"
-                elif not results:
-                    assistant_text = "I couldn’t analyze that yet. Try a more complete answer."
-                    st.session_state.last_misconception = None
-                    st.session_state.last_misconception_key = None
-                    st.session_state.mode = "analyze"
-                else:
-                    item = results[0]
-                    meta = item.get("meta", {})
-                    m = item["misconception"]
-                    t = item["teaching"]
-
-                    is_correct = meta.get("is_correct", False) or m.get("concept") == "No misconception"
-                    concept = m.get("concept", "this concept")
-
-                    if is_correct:
-                        parts = [
-                            "Nice work — I think you’ve got it.",
-                            (t.get("explanation", "") or "").strip(),
-                            "If you want, send another answer to analyze."
-                        ]
-                        assistant_text = "\n\n".join([p for p in parts if p])
-                        st.session_state.last_misconception = None
-                        st.session_state.last_misconception_key = None
-                        st.session_state.mode = "analyze"
-                    else:
-                        assistant_text = format_tutor_message(
-                            concept=concept,
-                            why_wrong=(m.get("why_wrong", "") or "").strip(),
-                            hint=(m.get("hint", "") or "").strip(),
-                            diagnostic=(m.get("diagnostic_question", "") or "").strip(),
-                            explanation=(t.get("explanation", "") or "").strip(),
-                            example=(t.get("analogy", "") or "").strip(),
-                            follow_up=(t.get("follow_up_question", "") or "").strip(),
-                        )
-
-                        st.session_state.last_misconception = m
-                        k = misconception_key(m)
-                        st.session_state.last_misconception_key = k
-                        st.session_state.attempts_by_key[k] = 0
-                        st.session_state.mode = "recheck"
-
-                # Clear attachment after send (ChatGPT-like)
-                st.session_state.uploaded_image_bytes = None
-                st.session_state.uploaded_image_mime = None
+            assistant_text = _first_text_message(tr) or "Done."
 
         except Exception:
             assistant_text = "I couldn’t reach the model right now (it may be overloaded). Please try again in a moment."
-            st.session_state.last_misconception = None
-            st.session_state.last_misconception_key = None
-            st.session_state.mode = "analyze"
+            st.session_state.last_tutor_response = None
 
         idx = st.session_state.pending_placeholder_index
         canceled = (st.session_state.cancel_requested and st.session_state.cancel_request_id == request_id)
         if not canceled and idx is not None and 0 <= idx < len(st.session_state.messages):
             st.session_state.messages[idx]["content"] = assistant_text
 
+        # Clear attachment after send (ChatGPT-like)
+        st.session_state.uploaded_image_bytes = None
+        st.session_state.uploaded_image_mime = None
+
         # cleanup
         st.session_state.pending = False
         st.session_state.pending_input = ""
         st.session_state.pending_placeholder_index = None
         st.session_state.pending_request_id = None
+        st.session_state._force_give_up = False
         if st.session_state.cancel_request_id == request_id:
             st.session_state.cancel_requested = False
             st.session_state.cancel_request_id = None
 
     st.rerun()
+
+# Render artifacts for the most recent model turn (at bottom)
+if st.session_state.last_tutor_response and not st.session_state.pending:
+    with st.container():
+        _render_artifacts(st.session_state.last_tutor_response)
 
 
 # ==========================
@@ -511,7 +443,7 @@ with rest_col:
     if st.session_state.uploaded_image_bytes:
         st.caption("📎 Image attached")
 
-placeholder = "Type your answer…" if st.session_state.mode == "analyze" else "Try again (I’ll recheck)…"
+placeholder = "Type your answer…"
 user_text = st.chat_input(placeholder, disabled=st.session_state.pending)
 
 # Debounce identical immediate resubmits
@@ -523,32 +455,26 @@ if user_text:
 if user_text and not st.session_state.pending:
     add_msg("user", user_text)
 
+    # Save last student answer for rubric context
+    st.session_state.last_student_answer = user_text
+
     # Academic-only guardrail
     if not is_academic_query(user_text) or not is_academic_query(st.session_state.current_question):
         add_msg("assistant", "I can help only with academic/learning questions. Please ask something educational (concepts, problems, explanations).")
         st.rerun()
 
     # Require question
-    if st.session_state.mode == "analyze" and not st.session_state.current_question.strip():
+    if not st.session_state.current_question.strip():
         add_msg("assistant", "Please enter the **Question** in the left panel first, then type your answer.")
         st.rerun()
 
-    # Give up shortcut
-    if is_give_up(user_text):
-        if st.session_state.mode == "recheck" and st.session_state.last_misconception:
-            reveal_answer_and_reset()
-            st.rerun()
-        else:
-            add_msg("assistant", "Share your answer and I’ll help.")
-            st.rerun()
-
-    # Start analysis
+    # Start analysis via router
     add_msg("assistant", "⏳ Analyzing…")
     st.session_state.pending_placeholder_index = len(st.session_state.messages) - 1
     st.session_state.pending_input = user_text
-    st.session_state.pending_mode = st.session_state.mode
     st.session_state.pending = True
     st.session_state.pending_request_id = str(uuid.uuid4())
     st.session_state.cancel_requested = False
     st.session_state.cancel_request_id = None
+    st.session_state._force_give_up = False
     st.rerun()
